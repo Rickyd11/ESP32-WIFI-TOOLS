@@ -1,33 +1,35 @@
+// Libraries: WiFi, WebServer
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+#include "dashboard.h"
+#include "your-nfty-cred.h"
+#include "your-nfty-cert.h"
 
 // Wifi credentials
 const char* WIFI_SSID = "Your WiFi";
 const char* WIFI_PASSWORD = "Your Password";
 
-// Webserver
+// Notification Variable
+const char* NTFY_TOPIC = "Name of your notification";
+
+// Server Configuration
 WebServer server(80);
 
-// Configuration
-#define MAX_DEVICES 20
-#define MAX_EVENTS 50
+constexpr int MAX_DEVICES = 20;
+constexpr int MAX_PORTS = 10;
+constexpr int MAX_EVENTS = 50;
 
-// Scanner Data
-String scannerIP = "";
-String scannerNetwork = "";
+constexpr unsigned long WIFI_TIMEOUT = 20000UL;
 
-int deviceCount = 0;
+constexpr unsigned long ONLINE_TIMEOUT = 300000UL;
 
-unsigned long lastScannerUpdate = 0;
+constexpr size_t MAX_REQUEST_SIZE = 16000;
 
-// Honeypot Data currently not configured
-String honeypotIP = "";
-
-unsigned long lastHoneypotUpdate = 0;
-
-int honeypotEventCount = 0;
-
-// Device Data
+// Device Structure
 struct Device{
   String ip;
   String hostname;
@@ -35,1006 +37,787 @@ struct Device{
   String vendor;
   String type;
 
-  int fingerprint;
+  uint16_t ports[MAX_PORTS] = {};
+  int portCount = 0;
 
-  unsigned long firstSeen;
-  unsigned long lastSeen;
+  int fingerprint = 0;
 
-  String ports;
+  unsigned long firstSeen = 0;
+  unsigned long lastSeen = 0;
+
+  bool online = false;
 };
 
-Device devices[MAX_DEVICES];
-
-//  Secuirty Event 
+// Security Event
 struct SecurityEvent{
   String source;
   String type;
-
   String sourceIP;
+  String severity;
 
-  int port;
-
+  int port = 0;
   String service;
-
   String details;
 
-  unsigned long timestamp;
+  unsigned long timestamp = 0;
 };
 
+// Global Data
+
+Device devices[MAX_DEVICES];
 SecurityEvent events[MAX_EVENTS];
 
+int deviceCount = 0;
 int eventCount = 0;
 
-// Setup function
-void setup() {
-  Serial.begin(115200);
+String scannerIP;
+String scannerNetwork;
+String honeypotIP;
 
-  delay(1000);
-  Serial.println("DASHBOARD");
+unsigned long lastScannerUpdate = 0;
+unsigned long lastHoneypotUpdate = 0;
+unsigned long lastWiFiAttempt = 0;
 
-  connectWiFi();
+bool serverStarted = false;
 
-  setupRoutes();
+bool scannerHealthKnown = false;
+bool scannerScanComplete = false;
+bool scannerScanTruncated = false;
 
-  server.begin();
-  Serial.println();
-  Serial.println("Web server started");
+uint32_t scannerScanSequence = 0;
+uint32_t scannerReportedDeviceCount = 0;
+uint32_t scannerReportedDurationMs = 0;
+uint32_t scannerCapacity = MAX_DEVICES;
 
-  Serial.print("Dashboard: http://");
-  Serial.println(WiFi.localIP());
+// Function Declaration
+void handleRoot();
+void handleStatus();
+void handleData();
+void handleScan();
+void handleHoneypot();
 
+void sendDocument(JsonDocument& doc);
+void sendError(int statusCode, const char* message);
+
+void updateDeviceStatus();
+void connectWiFi();
+
+bool sendNotification(const String& title, const String& message);
+
+void addSecurityEvent(String source, String type, String severity, String sourceIP, int port, String service, String details);
+bool eventAlreadyStored(const String& source, const String& type, const String& sourceIP, int port, const String& details, unsigned long timestamp);
+
+String determineSeverity(const String& type);
+
+void readIncomingPorts(JsonVariantConst value, Device& device);
+
+bool isValidIPv4(const String& ip);
+int findDeviceByIP(const String& ip);
+
+// Notification funtion
+bool sendNotification(const String& title, const String& message){
+
+  if(WiFi.status() != WL_CONNECTED){
+    Serial.println(F("ntfy: Wi-Fi disconnected."));
+    return false;
+  }
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url = "https://ntfy.sh/";
+  url += NTFY_TOPIC;
+
+  if (!http.begin(client, url)){
+    Serial.println(F("ntfy: Could not start HTTPS request."));
+    return false;
+  }
+
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
+
+  http.addHeader("Title", title);
+  http.addHeader("Content-Type", "text/plain");
+
+  int statusCode = http.POST(message);
+
+  ool success = statusCode >= 200 && statusCode < 300;
+
+  Serial.printf("ntfy HTTP status: %d\n", statusCode);
+
+  if (!success) {
+    Serial.println(http.getString());
+  }
+
+  http.end();
+
+  return success;
+}
+// Json Response Helper
+void sendDocument(JsonDocument& doc){
+  
+  String output;
+  output.reserve(measureJson(doc));
+  serializeJson(doc, output);
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json; charset=utf-8", output);
 }
 
-// Loop setup
-void loop() {
-  server.handleClient();
+// Error handler
+void sendError(int statusCode, const char* message){
+  JsonDocument doc;
 
+  doc["success"] = false;
+  doc["error"] = message;
+
+  String output;
+  serializeJson(doc, output);
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(statusCode, "application/json; charset=utf-8", output);
+}
+
+// Device Lookup
+int findDeviceByIP(const String& ip){
+  for (int i = 0; i < deviceCount; i++){
+    if (devices[i].ip == ip){
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+bool isValidIPv4(const String& ip){
+  IPAddress parsed;
+  return parsed.fromString(ip);
+}
+
+// Device Status
+void updateDeviceStatus(){
+  unsigned long now = millis();
+
+  bool scannerIsStale = lastScannerUpdate == 0 || now - lastScannerUpdate >= ONLINE_TIMEOUT;
+      
+  if (scannerHealthKnown && !scannerScanComplete && !scannerIsStale){
+    return;
+  }
+
+  for (int i = 0; i < deviceCount; i++){
+    unsigned long age = now - devices[i].lastSeen;
+
+    devices[i].online = age < ONLINE_TIMEOUT;
+  }
+}
+
+// API: Server Status
+void handleStatus(){
+  JsonDocument doc;
+
+  doc["server"] = WiFi.status() == WL_CONNECTED ? "ONLINE" : "OFFLINE";
+
+  doc["ip"] = WiFi.localIP().toString();
+  doc["uptime"] = millis() / 1000;
+
+  doc["deviceCount"] = deviceCount;
+  doc["eventCount"] = eventCount;
+
+  doc["freeHeap"] = ESP.getFreeHeap();
+  doc["minimumFreeHeap"] = ESP.getMinFreeHeap();
+
+  doc["scannerIP"] = scannerIP;
+  doc["network"] = scannerNetwork;
+
+  doc["scannerAge"] = lastScannerUpdate == 0 ? 999999 : (millis() - lastScannerUpdate) / 1000;
+
+  doc["honeypotAge"] = lastHoneypotUpdate == 0 ? 999999 : (millis() - lastHoneypotUpdate) / 1000;
+
+  doc["scannerHealthKnown"] = scannerHealthKnown;
+  doc["scanComplete"] = scannerScanComplete;
+  doc["scanTruncated"] = scannerScanTruncated;
+  doc["scanSequence"] = scannerScanSequence;
+  doc["scanDurationMs"] = scannerReportedDurationMs;
+  doc["scannerCapacity"] = scannerCapacity;
+
+  doc["scannerReportedDeviceCount"] = scannerReportedDeviceCount;
+
+  doc["onlineTimeoutMs"] = ONLINE_TIMEOUT;
+
+  sendDocument(doc);
+}
+
+// API: Network Data
+void handleData() {
   updateDeviceStatus();
 
-}
+  JsonDocument doc;
 
-// Connect to Wifi
-void connectWiFi(){
-   Serial.print("Connecting to WiFi");
+  doc["scannerIP"] = scannerIP;
+  doc["network"] = scannerNetwork;
+  doc["honeypotIP"] = honeypotIP;
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  doc["scanComplete"] = scannerScanComplete;
+  doc["scanTruncated"] = scannerScanTruncated;
+  doc["scanSequence"] = scannerScanSequence;
+  doc["scanDurationMs"] = scannerReportedDurationMs;
+  doc["scannerCapacity"] = scannerCapacity;
+  doc["scannerHealthKnown"] = scannerHealthKnown;
 
-  while (WiFi.status() != WL_CONNECTED) {
+  doc["scannerAge"] = lastScannerUpdate == 0 ? 999999 : (millis() - lastScannerUpdate) / 1000;
 
-    delay(500);
+  doc["onlineTimeoutMs"] = ONLINE_TIMEOUT;
 
-    Serial.print(".");
-  }
+  JsonArray deviceArray = doc["devices"].to<JsonArray>();
 
-  Serial.println();
+  for (int i = 0; i < deviceCount; i++){
+    JsonObject obj = deviceArray.add<JsonObject>();
 
-  Serial.println("WiFi connected");
+    obj["ip"] = devices[i].ip;
+    obj["hostname"] = devices[i].hostname;
+    obj["mac"] = devices[i].mac;
+    obj["vendor"] = devices[i].vendor;
+    obj["type"] = devices[i].type;
 
-  Serial.print("Dashboard IP: ");
-  Serial.println(WiFi.localIP());
+    JsonArray ports = obj["ports"].to<JsonArray>();
 
-  Serial.print("Gateway: ");
-  Serial.println(WiFi.gatewayIP());
-
-  Serial.print("Subnet: ");
-  Serial.println(WiFi.subnetMask());
-
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
-}
-
-// Dashboard 
-void handleDashboard(){
-  String html = R"rawliteral(
-
-  <!DOCTYPE html>
-
-  <html>
-
-  <head>
-
-  <meta name="viewport"
-  content="width=device-width, initial-scale=1">
-
-  <title>ESP32 NETWATCH</title>
-
-  <style>
-
-  body {
-
-      margin: 0;
-
-      background: #0b0f14;
-
-      color: #ffffff;
-
-      font-family: Arial, sans-serif;
-
-  }
-
-  .header {
-
-      background: #111820;
-
-      padding: 20px;
-
-      border-bottom: 1px solid #26313d;
-
-  }
-
-  .header h1 {
-
-      margin: 0;
-
-      font-size: 26px;
-
-  }
-
-  .header p {
-
-      color: #8b98a7;
-
-      margin-bottom: 0;
-
-  }
-
-  .container {
-
-      padding: 20px;
-
-      max-width: 1200px;
-
-      margin: auto;
-
-  }
-
-  .cards {
-
-      display: grid;
-
-      grid-template-columns:
-      repeat(auto-fit, minmax(200px, 1fr));
-
-      gap: 15px;
-
-  }
-
-  .card {
-
-      background: #111820;
-
-      border: 1px solid #26313d;
-
-      border-radius: 10px;
-
-      padding: 20px;
-
-  }
-
-  .card h3 {
-
-      margin-top: 0;
-
-      color: #8b98a7;
-
-  }
-
-  .value {
-
-      font-size: 30px;
-
-      font-weight: bold;
-
-  }
-
-  .online {
-
-      color: #32d583;
-
-  }
-
-  .warning {
-
-      color: #ffb020;
-
-  }
-
-  .danger {
-
-      color: #ff5c5c;
-
-  }
-
-  .section {
-
-      margin-top: 25px;
-
-  }
-
-  .section h2 {
-
-      font-size: 20px;
-
-  }
-
-  table {
-
-      width: 100%;
-
-      border-collapse: collapse;
-
-  }
-
-  th, td {
-
-      padding: 12px;
-
-      text-align: left;
-
-      border-bottom:
-      1px solid #26313d;
-
-  }
-
-  th {
-
-      color: #8b98a7;
-
-  }
-
-  .event {
-
-      background: #111820;
-
-      border-left: 4px solid #ff5c5c;
-
-      padding: 15px;
-
-      margin-bottom: 10px;
-
-      border-radius: 5px;
-
-  }
-
-  .small {
-
-      color: #8b98a7;
-
-      font-size: 13px;
-
-  }
-
-  </style>
-
-  </head>
-
-  <body>
-
-  <div class="header">
-
-  <h1>ESP32 NETWATCH</h1>
-
-  <p>Distributed Network Security Monitor</p>
-
-  </div>
-
-  <div class="container">
-
-  <div class="cards">
-
-  <div class="card">
-
-  <h3>SCANNER</h3>
-
-  <div id="scannerStatus"
-  class="value warning">
-
-  OFFLINE
-
-  </div>
-
-  </div>
-
-  <div class="card">
-
-  <h3>HONEYPOT</h3>
-
-  <div id="honeypotStatus"
-  class="value warning">
-
-  OFFLINE
-
-  </div>
-
-  </div>
-
-  <div class="card">
-
-  <h3>DEVICES</h3>
-
-  <div id="deviceCount"
-  class="value">
-
-  0
-
-  </div>
-
-  </div>
-
-  <div class="card">
-
-  <h3>SECURITY EVENTS</h3>
-
-  <div id="eventCount"
-  class="value">
-
-  0
-
-  </div>
-
-  </div>
-
-  </div>
-
-
-  <div class="section">
-
-  <h2>Network Devices</h2>
-
-  <div class="card">
-
-  <table>
-
-  <thead>
-
-  <tr>
-
-  <th>IP</th>
-
-  <th>Hostname</th>
-
-  <th>MAC</th>
-
-  <th>Type</th>
-
-  <th>Ports</th>
-
-  </tr>
-
-  </thead>
-
-  <tbody id="devices">
-
-  </tbody>
-
-  </table>
-
-  </div>
-
-  </div>
-
-
-  <div class="section">
-
-  <h2>Security Events</h2>
-
-  <div id="events">
-
-  </div>
-
-  </div>
-
-  </div>
-
-
-  <script>
-
-  async function updateDashboard() {
-
-      try {
-
-          const response = await fetch('/api/data');
-
-          const data = await response.json();
-
-          updateStatus(data);
-
-          updateDevices(data.devices);
-
-          updateEvents(data.events);
-
-      }
-
-      catch(error) {
-
-          console.log(error);
-
-      }
-
-  }
-
-
-  function updateStatus(data) {
-
-      const scanner =
-      document.getElementById(
-          'scannerStatus'
-      );
-
-      const honeypot =
-      document.getElementById(
-          'honeypotStatus'
-      );
-
-      const deviceCount =
-      document.getElementById(
-          'deviceCount'
-      );
-
-      const eventCount =
-      document.getElementById(
-          'eventCount'
-      );
-
-
-      const now = Date.now();
-
-
-      if ((now - data.scannerLastSeen)
-          < 90000) {
-
-          scanner.innerText = "ONLINE";
-
-          scanner.className =
-          "value online";
-
-      }
-
-      else {
-
-          scanner.innerText = "OFFLINE";
-
-          scanner.className = "value danger";
-
-      }
-
-
-      if ((now - data.honeypotLastSeen)
-          < 90000) {
-
-          honeypot.innerText = "ONLINE";
-
-          honeypot.className = "value online";
-
-      }
-
-      else {
-
-          honeypot.innerText = "OFFLINE";
-
-          honeypot.className = "value danger";
-
-      }
-
-
-      deviceCount.innerText = data.devices.length;
-
-      eventCount.innerText = data.events.length;if (data.scannerAge < 90000) {
-
-    scanner.innerText = "ONLINE";
-
-    scanner.className =
-    "value online";
-
-      }else {
-
-        scanner.innerText = "OFFLINE";
-
-        scanner.className = "value danger";
-
-      }
-
-
-      if (data.honeypotAge < 90000) {
-
-        honeypot.innerText = "ONLINE";
-
-        honeypot.className = "value online";
-
-      }else {
-
-          honeypot.innerText = "OFFLINE";
-
-          honeypot.className =
-          "value danger";
-
-      }
-
-  }
-
-
-  function updateDevices(devices) {
-
-      const table = document.getElementById('devices');
-
-      table.innerHTML = "";
-
-
-      devices.forEach(device => {
-
-          const row =
-          document.createElement('tr');
-
-          row.innerHTML = `
-
-          <td>${device.ip}</td>
-
-          <td>${device.hostname}</td>
-
-          <td>${device.mac}</td>
-
-          <td>${device.type}</td>
-
-          <td>${device.ports}</td>
-
-          `;
-
-          table.appendChild(row);
-
-      });
-
-  }
-
-
-  function updateEvents(events) {
-
-      const container = document.getElementById( 'events');
-
-      container.innerHTML = "";
-
-
-      events.slice().reverse()
-      .forEach(event => {
-
-          const div = document.createElement('div');
-
-          div.className = "event";
-
-          div.innerHTML = `
-
-          <strong>
-          ${event.type}
-          </strong>
-
-          <br>
-
-          ${event.service}
-
-          : ${event.port}
-
-          <br>
-
-          Source:
-          ${event.sourceIP}
-
-          <br>
-
-          <span class="small">
-
-          ${event.details}
-
-          </span>
-
-          `;
-
-          container.appendChild(div);
-
-      });
-
-  }
-
-
-  updateDashboard();
-
-  setInterval(updateDashboard,5000);
-
-  </script>
-
-  </body>
-
-  </html>
-
-  )rawliteral";
-
-  server.send(
-    200,
-    "text/html",
-    html
-  );
-}
-
-// Handles API status
-void handleStatus(){
-  String json = "{";
-
-  json += "\"server\":\"ONLINE\",";
-
-  json += "\"ip\":\"";
-  json += WiFi.localIP().toString();
-  json += "\",";
-
-  json += "\"uptime\":";
-  json += String(millis());
-
-  json += "}";
-
-  server.send( 200, "application/json", json);
-}
-
-// Recieve Scanner Data
-void handleScan(){
-  String body =
-  server.arg("plain");
-
-  Serial.println("SCAN DATA RECEIVED");
-
-  Serial.println(body);
-
-  parseScannerData(body);
-
-  server.send( 200, "application/json", "{\"status\":\"received\"}");
-}
-
-// Handle Honypot
-void handleHoneypot(){
-  String body =
-  server.arg("plain");
-  Serial.println("HONEYPOT EVENT RECEIVED");
-  Serial.println(body);
-  parseHoneypotData(body);
-  server.send( 200, "application/json", "{\"status\":\"received\"}");
-}
-
-// Parse Scanner Data
-void parseScannerData(String body){
-
-  // Scanner information
-  scannerIP = extractString(body, "scannerIP");
-
-  scannerNetwork = extractString(body, "network");
-
-  // Number of devices reported by scanner
-  int reportedDeviceCount =
-    extractNumber(body, "deviceCount");
-
-  // Reset current dashboard devices
-  deviceCount = 0;
-
-  for(int i = 0; i < MAX_DEVICES; i++){
-
-    devices[i].ip = "";
-    devices[i].hostname = "";
-    devices[i].mac = "";
-    devices[i].vendor = "";
-    devices[i].type = "";
-    devices[i].ports = "";
-    devices[i].fingerprint = 0;
-    devices[i].firstSeen = 0;
-    devices[i].lastSeen = 0;
-  }
-
-  // Find the devices array
-  String devicesKey = "\"devices\":[";
-
-  int devicesStart = body.indexOf(devicesKey);
-
-  if(devicesStart == -1){
-
-    Serial.println("ERROR: Devices array not found.");
-
-    lastScannerUpdate = millis();
-
-    return;
-  }
-
-  devicesStart += devicesKey.length();
-
-  // Find the end of the devices array
-  int devicesEnd =
-    body.indexOf("],\"events\"", devicesStart);
-
-  if(devicesEnd == -1){
-
-    Serial.println("ERROR: End of devices array not found.");
-
-    lastScannerUpdate = millis();
-
-    return;
-  }
-
-  // Extract only the devices section
-  String devicesJSON =
-    body.substring(devicesStart, devicesEnd + 1);
-
-  int searchPosition = 0;
-
-  // Parse each device
-  while(
-    searchPosition < devicesJSON.length() &&
-    deviceCount < MAX_DEVICES
-  ){
-
-    int objectStart =
-      devicesJSON.indexOf("{", searchPosition);
-
-    if(objectStart == -1){
-      break;
+    for (int p = 0; p < devices[i].portCount; p++){
+      ports.add(devices[i].ports[p]);
     }
 
-    int objectEnd =
-      devicesJSON.indexOf("}", objectStart);
-
-    if(objectEnd == -1){
-      break;
-    }
-
-    String deviceJSON =
-      devicesJSON.substring(
-        objectStart,
-        objectEnd + 1
-      );
-
-    // IP
-    devices[deviceCount].ip = extractString(deviceJSON, "ip");
-
-    // Hostname
-    devices[deviceCount].hostname = extractString(deviceJSON, "hostname");
-
-    // MAC
-    devices[deviceCount].mac = extractString(deviceJSON, "mac");
-
-    // Vendor
-    devices[deviceCount].vendor = extractString(deviceJSON, "vendor");
-
-    // Device type
-    devices[deviceCount].type = extractString(deviceJSON, "type");
-
-    // Fingerprint
-    devices[deviceCount].fingerprint = extractNumber(deviceJSON, "fingerprint");
-
-    // First seen
-    devices[deviceCount].firstSeen = extractNumber(deviceJSON, "firstSeen");
-
-    // Last seen
-    devices[deviceCount].lastSeen = extractNumber(deviceJSON, "lastSeen");
-
-    // Ports
-    devices[deviceCount].ports = extractPorts(deviceJSON);
-
-    // Debug information
-    Serial.println();
-    Serial.println("Device parsed:");
-
-    Serial.print("IP: ");
-    Serial.println(devices[deviceCount].ip);
-
-    Serial.print("Hostname: ");
-    Serial.println(devices[deviceCount].hostname);
-
-    Serial.print("MAC: ");
-    Serial.println(devices[deviceCount].mac);
-
-    Serial.print("Vendor: ");
-    Serial.println(devices[deviceCount].vendor);
-
-    Serial.print("Type: ");
-    Serial.println(devices[deviceCount].type);
-
-    Serial.print("Ports: ");
-    Serial.println(devices[deviceCount].ports);
-
-    deviceCount++;
-
-    searchPosition = objectEnd + 1;
+    obj["fingerprint"] = devices[i].fingerprint;
+    obj["firstSeen"] = devices[i].firstSeen;
+    obj["lastSeen"] = devices[i].lastSeen;
+    obj["online"] = devices[i].online;
   }
 
-  // Update scanner heartbeat
-  lastScannerUpdate = millis();
+  JsonArray eventArray = doc["events"].to<JsonArray>();
 
-  Serial.println("SCANNER DATA PARSED");
+  for (int i = 0; i < eventCount; i++) {
+    JsonObject obj = eventArray.add<JsonObject>();
 
+    obj["source"] = events[i].source;
+    obj["type"] = events[i].type;
+    obj["sourceIP"] = events[i].sourceIP;
+    obj["port"] = events[i].port;
+    obj["service"] = events[i].service;
+    obj["details"] = events[i].details;
+    obj["timestamp"] = events[i].timestamp;
+    obj["severity"] = events[i].severity;
+  }
 
-  Serial.print("Scanner IP: ");
-  Serial.println(scannerIP);
-
-  Serial.print("Network: ");
-  Serial.println(scannerNetwork);
-
-  Serial.print("Reported Devices: ");
-  Serial.println(reportedDeviceCount);
-
-  Serial.print("Parsed Devices: ");
-  Serial.println(deviceCount);
+  sendDocument(doc);
 }
 
-// Parse Honeypot data
-void parseHoneypotData(String body){
-  honeypotIP = extractString( body,"sensorIP");
+// Event Security
+String determineSeverity(const String& type){
+  if (type == "DEVICE_OFFLINE" || type == "DEVICE_RETURNED"){
+    return "WARNING";
+  }
 
-  String type = extractString( body, "type");
-  String sourceIP = extractString( body, "sourceIP");
+  if (type == "PORT_OPENED" || type == "HONEYPOT_ACTIVITY" || type == "HONEYPOT_LOGIN" || type == "HONEYPOT_ACCESS"){
+    return "WARNING";
+  }
 
-  int port = extractNumber( body, "port");
+  if (type == "DEVICE_NEW" || type == "PORT_CLOSED"){
+    return "INFO";
+  }
 
-  String service = extractString( body, "service");
-  String details = extractString( body, "details");
-  addSecurityEvent( "HONEYPOT", type, sourceIP, port, service, details);
-
-  honeypotEventCount++;
-  lastHoneypotUpdate = millis();
+  return "INFO";
 }
 
-String extractPorts(String json){
-
-  String search = "\"ports\":[";
-
-  int start = json.indexOf(search);
-
-  if(start == -1){
-    return "";
-  }
-
-  start += search.length();
-
-  int end =
-    json.indexOf("]", start);
-
-  if(end == -1){
-    return "";
-  }
-
-  String portData =
-    json.substring(start, end);
-
-  portData.trim();
-
-  if(portData.length() == 0){
-    return "";
-  }
-
-  String result = "";
-
-  int position = 0;
-  bool firstPort = true;
-
-  while(position < portData.length()){
-
-    int comma =
-      portData.indexOf(",", position);
-
-    String port;
-
-    if(comma == -1){
-
-      port =
-        portData.substring(position);
-
-      position =
-        portData.length();
-
-    }
-    else{
-
-      port =
-        portData.substring(
-          position,
-          comma
-        );
-
-      position = comma + 1;
-    }
-
-    port.trim();
-
-    if(port.length() > 0){
-
-      if(!firstPort){
-        result += ", ";
-      }
-
-      result += port;
-
-      firstPort = false;
+// Event Duplication
+bool eventAlreadyStored(const String& source, const String& type, const String& sourceIP, int port, const String& details, unsigned long timestamp){
+  for (int i = 0; i < eventCount; i++){
+    if (events[i].source == source && events[i].type == type && events[i].sourceIP == sourceIP && events[i].port == port && events[i].details == details && events[i].timestamp == timestamp){
+      return true;
     }
   }
 
-  return result;
+  return false;
 }
 
-// Add secuirty event
-void addSecurityEvent(String source, String type, String sourceIP, int port, String service, String details){
-  if (eventCount >= MAX_EVENTS) {
-
-    for (int i = 1;i < MAX_EVENTS;i++) {
-
+// Security Event Manager
+void addSecurityEvent(String source, String type, String severity, String sourceIP, int port, String service, String details){
+  if (eventCount >= MAX_EVENTS){
+    for (int i = 1; i < MAX_EVENTS; i++){
       events[i - 1] = events[i];
     }
 
     eventCount = MAX_EVENTS - 1;
   }
 
-  events[eventCount].source = source;
-  events[eventCount].type = type;
+  SecurityEvent& e = events[eventCount++];
 
-  events[eventCount].sourceIP = sourceIP;
-  events[eventCount].port = port;
+  e.source = source;
+  e.type = type;
+  e.severity = severity;
+  e.sourceIP = sourceIP;
+  e.port = port;
+  e.service = service;
+  e.details = details;
+  e.timestamp = millis() / 1000;
 
-  events[eventCount].service = service;
-  events[eventCount].details = details;
-  events[eventCount].timestamp = millis();
-
-  eventCount++;
+  Serial.printf("[EVENT] %s | %s | %s\n", type.c_str(), sourceIP.c_str(), details.c_str());
 }
 
-// Simple JSON String Extractor
-String extractString( String json, String key) {
-
-  String search = "\"" + key + "\":\"";
-
-  int start = json.indexOf(search);
-
-  if (start == -1) {
-    return "";
+// Port Parsing
+void readIncomingPorts( JsonVariantConst value, Device& device){
+  // Missing port field: preserve previously recorded ports.
+  if (value.isUnbound()){
+    return;
   }
 
-  start += search.length();
+  // Standard scanner format: [22, 80, 443]
+  if (value.is<JsonArrayConst>()){
+    JsonArrayConst ports = value.as<JsonArrayConst>();
 
-  int end =
-  json.indexOf("\"", start);
+    device.portCount = 0;
 
-  if (end == -1) {
-    return "";
+    for (JsonVariantConst portValue : ports){
+      if (device.portCount >= MAX_PORTS){
+        break;
+      }
+
+      int port = -1;
+
+      if (portValue.is<int>() || portValue.is<unsigned int>()){
+        port = portValue.as<int>();
+      } else if (portValue.is<const char*>()){
+        port = portValue.as<String>().toInt();
+      }
+
+      if (port < 1 || port > 65535) {
+        continue;
+      }
+
+      bool duplicate = false;
+
+      for (int i = 0; i < device.portCount; i++){
+        if (device.ports[i] == port){
+          duplicate = true;
+          break;
+        }
+      }
+
+      if (!duplicate){
+        device.ports[device.portCount++] = static_cast<uint16_t>(port);
+      }
+    }
+
+    return;
   }
 
-  return json.substring(start, end);
+  // Backward compatibility: "22,80,443" or "[\"22\",\"80\"]"
+  if (value.is<const char*>() || value.is<String>()){
+    String text = value.as<String>();
+    text.trim();
+
+    if (text.isEmpty()) {
+      device.portCount = 0;
+      return;
+    }
+
+    // Remove JSON array brackets if present.
+    text.replace("[", "");
+    text.replace("]", "");
+    text.replace("\"", "");
+    text.replace("'", "");
+
+    device.portCount = 0;
+
+    int start = 0;
+
+    while (start < text.length() && device.portCount < MAX_PORTS){
+      int comma = text.indexOf(',', start);
+
+      if (comma < 0){
+        comma = text.length();
+      }
+
+      String part = text.substring(start, comma);
+      part.trim();
+
+      bool digitsOnly = !part.isEmpty();
+
+      for (unsigned int i = 0; i < part.length(); i++){
+        if (!isDigit(part[i])) {
+          digitsOnly = false;
+          break;
+        }
+      }
+
+      if (digitsOnly){
+        long port = part.toInt();
+
+        if (port >= 1 && port <= 65535){
+          bool duplicate = false;
+
+          for (int i = 0; i < device.portCount; i++){
+            if (device.ports[i] == port){
+              duplicate = true;
+              break;
+            }
+          }
+
+          if (!duplicate){
+            device.ports[device.portCount++] = static_cast<uint16_t>(port);
+          }
+        }
+      }
+
+      start = comma + 1;
+    }
+  }
 }
 
-// Simple JSON Numbwe Extractor
-int extractNumber(String json, String key) {
-
-  String search = "\"" + key + "\":";
-
-  int start = json.indexOf(search);
-
-  if (start == -1) {
-    return 0;
+// API: Scanner Ingestion
+void handleScan(){
+  if (server.method() != HTTP_POST){
+    sendError(405, "Method not allowed");
+    return;
   }
 
-  start += search.length();
-
-  int end = start;
-
-  while (end < json.length() && isDigit(json[end])) {
-
-    end++;
+  if (!server.hasArg("plain")){
+    sendError(400, "Missing JSON body");
+    return;
   }
 
-  return json.substring(start, end).toInt();
+  String body = server.arg("plain");
+
+  if (body.length() > MAX_REQUEST_SIZE){
+    sendError(413, "Payload too large");
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error){
+    Serial.print(F("[ERROR] Invalid scanner JSON: "));
+    Serial.println(error.c_str());
+
+    sendError(400, "Invalid JSON");
+    return;
+  }
+
+  if (!doc["devices"].is<JsonArray>()){
+    sendError(400, "Missing or invalid devices array");
+    return;
+  }
+
+  bool hasCompleteField =  doc["scanComplete"].is<bool>();
+
+  bool incomingComplete = hasCompleteField ? doc["scanComplete"].as<bool>() : true;
+
+  bool incomingTruncated = doc["scanTruncated"] | false;
+
+  uint32_t incomingSequence = doc["scanSequence"] | 0;
+
+  uint32_t incomingDuration = doc["scanDurationMs"] | 0;
+
+  uint32_t incomingCapacity = doc["scannerCapacity"] | MAX_DEVICES;
+
+  if (incomingTruncated){
+    incomingComplete = false;
+  }
+
+  scannerIP = doc["scannerIP"] | scannerIP;
+  scannerNetwork = doc["network"] | scannerNetwork;
+
+  scannerHealthKnown = hasCompleteField;
+  scannerScanComplete = incomingComplete;
+  scannerScanTruncated = incomingTruncated;
+
+  scannerScanSequence = incomingSequence;
+  scannerReportedDurationMs = incomingDuration;
+  scannerCapacity = incomingCapacity;
+
+  lastScannerUpdate = millis();
+
+  JsonArray incomingDevices =
+      doc["devices"].as<JsonArray>();
+
+  scannerReportedDeviceCount = incomingDevices.size();
+
+  for (JsonObject incoming : incomingDevices){
+    String ip = incoming["ip"] | "";
+
+    if (ip.isEmpty() || !isValidIPv4(ip)){
+      continue;
+    }
+
+    int index = findDeviceByIP(ip);
+
+    bool isNewDevice = index < 0;
+
+    if (isNewDevice){
+      if (deviceCount >= MAX_DEVICES){
+        Serial.println(F("[WARN] Server inventory capacity reached."));
+        continue;
+      }
+
+      index = deviceCount++;
+
+      devices[index].ip = ip;
+      devices[index].firstSeen = millis();
+      devices[index].lastSeen = millis();
+      devices[index].online = true;
+
+      devices[index].hostname = "";
+      devices[index].mac = "";
+      devices[index].vendor = "";
+      devices[index].type = "";
+      devices[index].fingerprint = 0;
+      devices[index].portCount = 0;
+
+      Serial.print(F("[INVENTORY] New device: "));
+      Serial.println(ip);
+    }
+
+    Device& d = devices[index];
+
+    String hostname = incoming["hostname"] | "";
+    String mac = incoming["mac"] | "";
+    String vendor = incoming["vendor"] | "";
+    String type = incoming["type"] | "";
+
+    if (!hostname.isEmpty() && hostname != "UNKNOWN"){
+      d.hostname = hostname;
+    }
+
+    if (!mac.isEmpty() && mac != "UNKNOWN"){
+      d.mac = mac;
+    }
+
+    if (!vendor.isEmpty() && vendor != "UNKNOWN" && vendor != "Unknown vendor"){
+      d.vendor = vendor;
+    } else if (d.vendor.isEmpty()){
+      d.vendor = vendor;
+    }
+
+    if (!type.isEmpty() && type != "UNKNOWN" && type != "Unknown"){
+      d.type = type;
+    }
+
+    readIncomingPorts(incoming["ports"], d);
+
+    if (incoming["fingerprint"].is<int>()){
+      d.fingerprint = incoming["fingerprint"].as<int>();
+    }
+
+   
+    d.lastSeen = millis();
+    d.online = true;
+
+    Serial.printf("[DEVICE] %s | online | ports=%d\n", d.ip.c_str(), d.portCount);
+  }
+
+  // Ingest scanner events.
+  JsonArray incomingEvents = doc["events"].as<JsonArray>();
+
+  for (JsonObject incomingEvent : incomingEvents){
+    
+    String type = incomingEvent["type"] | "SCAN_EVENT";
+    String sourceIP = incomingEvent["sourceIP"] | "";
+
+    if (sourceIP.isEmpty()){
+      sourceIP = incomingEvent["ip"] | "";
+    }
+
+    String details = incomingEvent["details"] | "";
+
+    if (details.isEmpty()){
+      details = incomingEvent["description"] | "";
+    }
+
+    int port = incomingEvent["port"] | 0;
+    String service = incomingEvent["service"] | "";
+
+    if (service.isEmpty() && port > 0){
+      service = "TCP";
+    }
+
+    unsigned long eventTimestamp = incomingEvent["timestamp"] | 0UL;
+
+    String severity = determineSeverity(type);
+
+    if (eventAlreadyStored("SCANNER", type, sourceIP, port, details, eventTimestamp)){
+      continue;
+    }
+
+    addSecurityEvent("SCANNER", type, severity, sourceIP, port, service, details);
+
+    if (eventTimestamp != 0 && eventCount > 0) {
+      events[eventCount - 1].timestamp = eventTimestamp;
+    }
+  }
+
+  Serial.println();
+  Serial.println(F("Scanner Update"));
+
+  Serial.print(F("Scanner IP: "));
+  Serial.println(scannerIP);
+
+  Serial.print(F("Reported devices: "));
+  Serial.println(scannerReportedDeviceCount);
+
+  Serial.print(F("Complete: "));
+  Serial.println(scannerScanComplete ? F("yes") : F("no"));
+
+  Serial.print(F("Truncated: "));
+  Serial.println(scannerScanTruncated ? F("yes") : F("no"));
+
+  Serial.print(F("Stored events: "));
+  Serial.println(eventCount);
+
+  JsonDocument response;
+
+  response["success"] = true;
+  response["message"] = "Scan received";
+  response["scanComplete"] = scannerScanComplete;
+  response["scanSequence"] = scannerScanSequence;
+  response["receivedDevices"] = scannerReportedDeviceCount;
+  response["storedDevices"] = deviceCount;
+  response["storedEvents"] = eventCount;
+
+  sendDocument(response);
 }
 
-// JSON Escape
-String escapeJSON( String input) {
+// API: Honey Pot Ingestion
+void handleHoneypot(){
+  if (server.method() != HTTP_POST){
+    sendError(405, "Method not allowed");
+    return;
+  }
 
-  input.replace("\\", "\\\\");
-  input.replace("\"", "\\\"");
-  input.replace("\n", "\\n");
-  input.replace( "\r", "\\r");
+  if (!server.hasArg("plain")){
+    sendError(400, "Missing JSON body");
+    return;
+  }
 
-  return input;
+  String body = server.arg("plain");
+
+  if (body.length() > MAX_REQUEST_SIZE){
+    sendError(413, "Payload too large");
+    return;
+  }
+
+  JsonDocument doc;
+
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error){
+    sendError(400, "Invalid JSON");
+    return;
+  }
+
+  honeypotIP = doc["honeypotIP"] | "";
+  lastHoneypotUpdate = millis();
+
+  String type = doc["type"] | "HONEYPOT_ACTIVITY";
+  String sourceIP = doc["sourceIP"] | "";
+  int port = doc["port"] | 0;
+  String service = doc["service"] | "Unknown";
+  String details = doc["details"] | "";
+
+  addSecurityEvent("HONEYPOT", type, determineSeverity(type), sourceIP, port, service, details);
+
+  JsonDocument response;
+
+  response["success"] = true;
+  response["message"] = "Honeypot event received";
+
+  sendDocument(response);
 }
 
-// 404
-void handleNotFound() {
+// Root Dashboard
+void handleRoot(){
+  server.sendHeader("Cache-Control", "no-store");
 
-  server.send(404, "text/plain", "NETWATCH: Endpoint not found");
+  server.send_P(200, "text/html; charset=utf-8", DASHBOARD_HTML);
+}
+
+// Wifi Connection
+void connectWiFi(){
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_TIMEOUT){
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED){
+    Serial.print(F("NETWATCH IP: "));
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(F("[WARN] Initial Wi-Fi connection failed."));
+  }
+}
+
+//Setup
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println();
+  Serial.println(F("ESP32 #3 DASHBOARD"));
+
+  connectWiFi();
+
+  server.on("/", HTTP_GET, handleRoot);
+
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/data", HTTP_GET, handleData);
+
+  server.on("/api/scan", HTTP_POST, handleScan);
+  server.on("/api/honeypot", HTTP_POST, handleHoneypot);
+
+  server.onNotFound([](){
+    sendError(404, "Not found");
+  });
+
+  if (WiFi.status() == WL_CONNECTED){
+    server.begin();
+    serverStarted = true;
+
+    Serial.println(F("[OK] NETWATCH server started."));
+
+    String dashboardURL = "http://";
+    dashboardURL += WiFi.localIP().toString();
+    dashboardURL += "/";
+
+    Serial.print(F("Dashboard URL: "));
+    Serial.println(dashboardURL);
+
+    sendNotification( "Your message", "Your dashboard is ready:\n" + dashboardURL);
+  }
+}
+
+// Main Loop
+void loop(){
+  if (WiFi.status() == WL_CONNECTED){
+    if (!serverStarted){
+      server.begin();
+      serverStarted = true;
+
+      Serial.println(F("[OK] NETWATCH server restarted."));
+    }
+
+    server.handleClient();
+  } else {
+    if (serverStarted){
+      serverStarted = false;
+      Serial.println(F("[WARN] Wi-Fi disconnected."));
+    }
+
+    if (millis() - lastWiFiAttempt >= WIFI_TIMEOUT){
+      lastWiFiAttempt = millis();
+      WiFi.reconnect();
+    }
+  }
 }
