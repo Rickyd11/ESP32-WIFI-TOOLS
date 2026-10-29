@@ -1,7 +1,11 @@
 // Libraries needed for the file
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <esp32ARP.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
 
 // Wifi credentials
 const char* ssid = "Your wifi";
@@ -19,16 +23,12 @@ const char* SERVER_URL = "DASHBOARD LINK";
 #define MAX_EVENTS 30
 
 // Variable that allows the device to scan every 30 sec
-const unsigned long SCAN_INTERVAL = 30000;
-
-// Maximum amount of time to wait for a device to respond to a ping.
-const uint16_t PING_TIMEOUT = 250;
-
-// Stores the IP address assigned to the ESP32 scanner
-IPAddress localIP;
-
-// Maximum number of IPv4 hosts that can exist in a typical /24 network
-#define MAX_HOSTS 254
+constexpr unsigned long SCAN_INTERVAL = 30000UL;
+constexpr unsigned long WIFI_RETRY_INTERVAL = 5000UL;
+constexpr unsigned long ARP_RETRY_INTERVAL = 5000UL;
+constexpr uint16_t CONNECT_TIMEOUT_MS = 250;
+constexpr uint16_t ARP_WAIT_MS = 100;
+constexpr uint8_t OFFLINE_MISSED_SCANS = 2;
 
 //Common Ports for the device to scan
 const uint16_t COMMON_PORTS[] = { 
@@ -51,10 +51,9 @@ struct NetworkDevice {
   String hostname;
   String mac;
   String vendor;
+  String deviceType;
 
   bool online;
-
-  String deviceType;
 
   uint16_t openPorts[MAX_PORTS];
   int portCount;
@@ -64,463 +63,790 @@ struct NetworkDevice {
   unsigned long firstSeen;
   unsigned long lastSeen;
 };
-
 // Security Event
-struct SecurityEvent{
-
+struct SecurityEvent {
   String type;
   String ip;
   String description;
+  int port;
   unsigned long timestamp;
-
 };
 
 // Global Storage 
 NetworkDevice currentDevices[MAX_DEVICES];
-
 NetworkDevice previousDevices[MAX_DEVICES];
-
 SecurityEvent events[MAX_EVENTS];
 
 int currentDeviceCount = 0;
 int previousDeviceCount = 0;
 int eventCount = 0;
 
+uint32_t droppedEventCount = 0;
+int lastUploadHttpCode = 0;
+bool lastUploadSucceeded = false;
+
+bool arpReady = false;
+bool baselineReady = false;
+bool scannerInitialized = false;
+bool mdnsReady = false;
+
+IPAddress localIP;
+IPAddress networkAddress;
+IPAddress subnetMask;
+
+bool lastScanComplete = false;
+bool lastScanTruncated = false;
+
+uint32_t scanSequence = 0;
+unsigned long lastScanDurationMs = 0;
+unsigned long lastArpRetry = 0;
+
+struct MissingDeviceTrack {
+  IPAddress ip;
+  uint8_t missedCompleteScans;
+  bool offlineEventSent;
+};
+
+MissingDeviceTrack missingTracks[MAX_DEVICES];
+int missingTrackCount = 0;
+
 unsigned long lastScan = 0;
+unsigned long lastWiFiRetry = 0;
 
 // Function Declearation
-void connectToWiFi();
-void  printNetworkInformation();
+bool connectWiFi();
+void maintainWiFi();
+void initializeScannerIfReady();
+void printNetworkInformation();
+
+IPAddress calculateNetworkAddress();
 void runNetworkScan();
 void clearCurrentScan();
 void discoverDevices();
-bool checkHost(IPAddress ip);
-void collectDeviceInfo(NetworkDevice &device);
-void detectHostname(NetworkDevice &device);
-void identifyVendor(NetworkDevice &device);
-void detectService(NetworkDevice &device);
+
+bool checkHost(IPAddress ip, String& discoveredMac);
+String macToString(const mac_addr_t& mac);
+String lookupVendor(const String& mac);
+String detectHostname(IPAddress ip);
+
+void collectDeviceInfo(NetworkDevice& device);
+void detectHostname(NetworkDevice& device);
+void initializeMDNS();
+String queryMDNSHostname(IPAddress target);
+static String queryNetBIOSHostname(IPAddress target);
+void identifyVendor(NetworkDevice& device);
+void detectService(NetworkDevice& device);
 bool checkPort(IPAddress ip, uint16_t port);
-void fingerprintDevice(NetworkDevice &device);
+void fingerprintDevice(NetworkDevice& device);
+
 void compareScans();
-void generateNewDeviceEvent(NetworkDevice &device);
-void generateOfflineDeviceEvent(NetworkDevice &device);
-void generatePortChangeEvent(NetworkDevice &device,uint16_t port,bool opened);
-void addEvent(String type,String ip,String description);
+void processMissingDeviceTracks();
+bool currentScanContains(IPAddress ip);
+bool isMissingDeviceTracked(IPAddress ip);
+bool sameDevice(const NetworkDevice& a, const NetworkDevice& b);
+void removeMissingTrack(int index);
+
+void generateNewDeviceEvent(NetworkDevice& device);
+void generateOfflineDeviceEvent(NetworkDevice& device);
+void generatePortChangeEvent(NetworkDevice& device, uint16_t port, bool opened);
+void addEvent(const String& type, const String& ip, const String& description, int port = 0);
+
 void printDevices();
 void printEvents();
 void sendResultsToServer();
 void saveCurrentAsPrevious();
-IPAddress calculateNetworkAddress();
-void printIPAddress(const char* label,IPAddress address);
 
-// Setup
-void setup() {
-
+// Setup 
+void setup(){
   Serial.begin(115200);
-  // Gives the ESP32 a moment to initialize before starting the scanner
   delay(1000);
-  // Display a startup message
-  Serial.println("ESP32 Network Watcher V1");
-  // Connects to the Wifi
-  connectToWiFi();
 
-  // Confirms the esp32 is connected to the wifi and stops it if the esp did not connect
-  if(WiFi.status() != WL_CONNECTED){
-    Serial.println("[!] Wi-Fi connection failed.");
+
+  Serial.println(F("Scanner is ready"));
+
+  connectWiFi();
+  initializeScannerIfReady();
+}
+
+// Loop 
+void loop(){
+  maintainWiFi();
+
+  if (WiFi.status() != WL_CONNECTED){
+    delay(10);
     return;
-  };
+  }
 
-  // Store the ESP32's local IP address for network scanning
+  initializeScannerIfReady();
   localIP = WiFi.localIP();
+  subnetMask = WiFi.subnetMask();
+  networkAddress = calculateNetworkAddress();
+  initializeMDNS();
 
-  // Initialize the ARP functionality used for network device discovery
-  if (arp.init() == ERR_OK) {
-    Serial.println("ARP initialized");
-  } else {
-    Serial.println("ARP initialization failed");
-  };
-
-  // Display information about the connected network
-  printNetworkInformation();
-  
-  // Indicate that the scanner has completed initialization
-  Serial.println("Scanner Ready");
-
-  // Short delay before starting the first network scan
-  delay(2000);
-
-  //  Perform the initial network scan
-  runNetworkScan();
-
-  // Record when the first scan was completed
-  lastScan = millis();
-}
-
-// Loop
-void loop() {
-  // Confirming the Wifi is connected
-  if(WiFi.status() != WL_CONNECTED){
-
-    Serial.println("[!] Wi-Fi disconnected.");
-
-    // Connect the device to the network
-    connectToWiFi();
-
+  if (!scannerInitialized) {
+    delay(10);
     return;
   }
 
-  // Check whether the configured scan interval has elapsed
-  if (millis() - lastScan >=SCAN_INTERVAL) {
-    // Update the timestamp before starting the scan
-    lastScan = millis();
-    // Run another network scan.
+  if (!arpReady && millis() - lastArpRetry >= ARP_RETRY_INTERVAL){
+
+    lastArpRetry = millis();
+    Serial.println(F("[INFO] Retrying ARP initialization..."));
+
+    if (arp.init() == ERR_OK){
+      arpReady = true;
+      Serial.println(F("[OK] ARP initialized on retry."));
+
+      runNetworkScan();
+      lastScan = millis();
+    } else {
+      Serial.println(F("[WARN] ARP retry failed."));
+    }
+  }
+
+  if (arpReady && millis() - lastScan >= SCAN_INTERVAL){
+
     runNetworkScan();
+    lastScan = millis();
   }
 
+  delay(2);
 }
 
-// Function to connect esp32 to wifi
-void connectToWiFi(){
-  Serial.println("Wifi connected");
-  // Set the ESP32 to station mode so it can connect to an existing Wi-Fi network
+// Connect to Wifi
+bool connectWiFi(){
   WiFi.mode(WIFI_STA);
-  // Begin the connection using the configured Wi-Fi credentials
-  WiFi.begin(ssid,password);
-  // Tracks the attempts to connect to the wifi
-  int attempts = 0;
-  // Wait for the ESP32 to connect, with a maximum of 30 attempts
-  while(WiFi.status() != WL_CONNECTED && attempts < 30){
-    //  Wait 500 milliseconds between connection attempts
+  WiFi.setSleep(false);
+
+  Serial.print(F("Connecting to "));
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const unsigned long startedAt = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startedAt < 15000UL){
+
+    Serial.print('.');
     delay(500);
-    
-    Serial.print(".");
-    // Add an attempt
-    attempts++;
-  }
-  // Check whether the ESP32 successfully connected to Wi-Fi
-  if(WiFi.status() == WL_CONNECTED){
-
-    Serial.println("Wifi Connected");
-    Serial.print("SSID: ");
-    Serial.println(ssid);
-    // Display the IP address assigned to the ESP32
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
-    // Display the Wi-Fi signal strength in dBm
-    Serial.print("RSSI: ");
-    Serial.println(WiFi.RSSI());
-    
-  }else{
-    // Report that the ESP32 was unable to connect after the maximum attempts
-    Serial.println("Failed to connect to Wi-Fi.");
-  }
-}
-// Network information
-void printNetworkInformation(){
-  Serial.println("Network Information");
-
-  printIPAddress("IP Address: ",WiFi.localIP());
-  printIPAddress("Gateway: ",WiFi.gatewayIP());
-  printIPAddress("Subnet: ",WiFi.subnetMask());
-  printIPAddress("DNS: ",WiFi.dnsIP());
-  
-  IPAddress network = calculateNetworkAddress();
-
-  printIPAddress("Network: ",network);
-}
-// Prints the IP address
-void printIPAddress(const char* label, IPAddress address){
-
-  Serial.print(label);
-
-  Serial.println(address);
-}
-// Calculate the network address from the ESP32's IP address and subnet mask
-IPAddress calculateNetworkAddress(){
-  // Get the IP address currently assigned to the ESP32
-  IPAddress ip = WiFi.localIP();
-  // Get the subnet mask of the connected network
-  IPAddress subnet = WiFi.subnetMask();
-  // Create an IPAddress object to store the calculated network address
-  IPAddress network;
-  // Calculate the network address by applying a bitwise AND
-  // between each IP address octet and the subnet mask.
-  for(int i = 0;i < 4;i++){
-
-    network[i] = ip[i] & subnet[i];
-  }
-  // Return the calculated network address
-  return network;
-}
-// Runs the network scan
-void runNetworkScan(){
-  Serial.println("Starting Scan");
-
-  // Clears any scans
-  clearCurrentScan();
-
-  // Discover Host
-
-  Serial.println("Discovering active hosts...");
-  discoverDevices();
-  Serial.print("Host Discoverd");
-
-  Serial.println(currentDeviceCount);
-  // Finger printing devices
-  Serial.println("Fingerprinting devices...");
-  for(int i = 0;i < currentDeviceCount;i++){
-    collectDeviceInfo(currentDevices[i]);
-
   }
 
-  //Compare devices
-  Serial.println("Comparing with previous scan...");
-  compareScans();
+  Serial.println();
 
-  // Scan results
-  Serial.print("Scan completed");
-  printDevices();
-
-  // Secuirty Events
-  Serial.println("Security Events");
-  printEvents();
-
-  // Send to ESP32 #3
-  Serial.println("Sending to ESP32");
-  sendResultsToServer();
-
-  // Save baseline
-  saveCurrentAsPrevious();
-  Serial.println("Scan Done");
-}
-// Resets the scan
-void clearCurrentScan(){
-  // Reset the number of devices found in the current scan
-  currentDeviceCount = 0;
-  // Reset each device entry in the device list
-  for(int i = 0;i < MAX_DEVICES;i++){
-    // Mark the device as offline until it is discovered again
-    currentDevices[i].online = false;
-    // Clear the list of open ports from the previous scan
-    currentDevices[i].portCount = 0;
-    // Reset the device fingerprint score
-    currentDevices[i].fingerprintScore = 0;
-  }
-}
-// Discovering Devices
-void discoverDevices(){
-
-  IPAddress ip = WiFi.localIP();
-  IPAddress subnet = WiFi.subnetMask();
-  IPAddress network = calculateNetworkAddress();
-
-  // Actual Network
-  Serial.print("Network: ");
-  Serial.println(network);
-
-  // Subnet
-  Serial.print("Subnet: ");
-  Serial.println(subnet);
-
-  // Most home networks will be /24.
-  // We calculate the network address instead of assuming
-  // that the network always starts at x.x.x.0.
-
-  if(subnet[0] != 255 || subnet[1] != 255 || subnet[2] != 255){
-
-    Serial.println("Warning: unusual subnet detected.");
-    Serial.println("V2 currently scans the final octet");
-
-  }
-
-  // Scan host
-  for(int host = 1; host < 255; host++){
-    // Don't scan ourselves
-    if(host == localIP[3]){
-      continue;
-    }
-
-    IPAddress target(network[0], network[1], network[2], host);
-
-    Serial.print("[Ping]");
-    Serial.print(target);
-
-    if(checkHost(target)){
-
-      Serial.print("Online");
-
-      if(currentDeviceCount >= MAX_DEVICES){
-
-        Serial.print("Mac Devices reached");
-        return;
-      }
-
-      NetworkDevice &device = currentDevices[currentDeviceCount];
-
-      device.ip = target;
-
-      device.online = true;
-
-      // Checks wheither the device has been scanned before or not
-
-      bool existed = false;
-
-      for(int i = 0; i < previousDeviceCount; i++){
-
-        if(previousDevices[i].ip == target){
-
-          existed = true;
-
-          device.firstSeen = previousDevices[i].firstSeen;
-          break;
-        }
-      }
-
-      if(!existed){
-        device.firstSeen = millis();
-      }
-
-      device.lastSeen = millis();
-
-      device.hostname = "";
-      device.mac = "UNKNOWN";
-      device.vendor = "UNKNOWN";
-      device.deviceType = "UNKNOWN";
-
-      device.portCount = 0;
-      device.fingerprintScore = 0;
-
-      currentDeviceCount++;
-      Serial.print("Device Found");
-      Serial.println(target);
-    }else{
-
-      Serial.print("Offline");
-
-    }
-    delay(5);
-  }
-}
-// Checks the host
-bool checkHost(IPAddress ip) {
-
-  Serial.print("[ARP] ");
-  Serial.print(ip);
-  Serial.print(" -> ");
-
-  // Ask the network who owns this IP
-  int requestResult = arp.sendRequest(ip.toString());
-
-  if (requestResult != ERR_OK) {
-    Serial.println("ARP request failed");
+  if (WiFi.status() != WL_CONNECTED){
+    Serial.println(F("[ERROR] Wi-Fi connection failed."));
     return false;
   }
 
-  // Give the device a moment to respond
-  delay(100);
+  localIP = WiFi.localIP();
 
-  // Look for the device in the ARP table
-  mac_addr_t mac;
+  Serial.println(F("[OK] Wi-Fi connected."));
 
-  int result = arp.lookupEntry(ip.toString(), mac);
+  Serial.print(F("Scanner IP: "));
+  Serial.println(localIP);
 
-  if (result == ERR_OK) {
+  Serial.print(F("Scanner MAC: "));
+  Serial.println(WiFi.macAddress());
 
-    Serial.print("FOUND | MAC: ");
-    printlnMacAddr(mac);
+  return true;
+}
 
-    return true;
+// Initializes the scanner once Wi-Fi is connected
+void initializeScannerIfReady(){
+  if (scannerInitialized || WiFi.status() != WL_CONNECTED){
+    return;
   }
 
-  Serial.println("NO RESPONSE");
+  localIP = WiFi.localIP();
+  subnetMask = WiFi.subnetMask();
+  networkAddress = calculateNetworkAddress();
 
-  return false;
+  if (arp.init() == ERR_OK){
+    arpReady = true;
+    Serial.println(F("[OK] ARP initialized."));
+  } else {
+    arpReady = false;
+
+    Serial.println(F("[ERROR] ARP initialization failed."));
+    Serial.println(F("MAC discovery may not work."));
+  }
+
+  printNetworkInformation();
+
+  scannerInitialized = true;
+
+  Serial.println(F("[OK] Scanner initialized."));
+
+  if (arpReady){
+    runNetworkScan();
+    lastScan = millis();
+  }
 }
-// Collects the device info
-void collectDeviceInfo(NetworkDevice &device){
 
-  Serial.print("Device: ");
-  Serial.println(device.ip);
+// Maintain the Wifi connection
+void maintainWiFi(){
+  if (WiFi.status() == WL_CONNECTED){
+    return;
+  }
 
-  // Host name
-  detectHostname(device);
+  if (millis() - lastWiFiRetry < WIFI_RETRY_INTERVAL){
+    return;
+  }
 
-  // Mac / Vendor
-  identifyVendor(device);
+  lastWiFiRetry = millis();
 
-  // TCP Service
-  detectService(device);
+  Serial.println(F("[WARN] Wi-Fi disconnected. Reconnecting..."));
 
-  // Fingerprint
-  fingerprintDevice(device);
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
-// Detects Hostname
-void detectHostname(NetworkDevice &device){
-  device.hostname = "UNKNOWN";
 
+// Network Information
+IPAddress calculateNetworkAddress(){
+  IPAddress ip = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  IPAddress network;
 
-  Serial.print( "Hostname: ");
+  for (int i = 0; i < 4; i++){
+    network[i] = ip[i] & mask[i];
+  }
 
-  Serial.println(device.hostname);
+  return network;
 }
-// Mac and Vendor detection
-void identifyVendor(NetworkDevice &device){
 
-  device.mac = "UNKNOWN";
-  device.vendor = "UNKNOWN";
-  
-  Serial.print("MAC: ");
-  Serial.println(device.mac);
+// Initializes mDNS when Wi-Fi is connected allows for the device to be discovered on the local network using its hostname
+void initializeMDNS() {
+  if (mdnsReady || WiFi.status() != WL_CONNECTED){
+    return;
+  }
 
-  Serial.print("Vendor: ");
-  Serial.println(device.vendor);
+  mdnsReady = MDNS.begin("netwatch-sentinel");
+
+  if (mdnsReady){
+    Serial.println(F("[MDNS] Initialized"));
+  } else {
+    Serial.println(F("[MDNS] Initialization failed"));
+  }
 }
-// Detects Services
-void detectService(NetworkDevice &device){
 
-  Serial.println("Services:");
-  
-  for(int i = 0; i < commonPortCount; i++){
+// Queries mDNS services on the local network to identify a device's hostname by matching the discovered service addresses to the target IP address
+String queryMDNSHostname(IPAddress target){
+  if (!mdnsReady){
+    return "UNKNOWN";
+  }
 
-    if(device.portCount >= MAX_PORTS){
+  const char* services[] = {"http","ipp","airplay","raop","googlecast","ssh"};
+
+  const size_t serviceCount = sizeof(services) / sizeof(services[0]);
+
+  for (size_t s = 0; s < serviceCount; ++s){
+    int count = MDNS.queryService(services[s], "tcp");
+
+    for (int i = 0; i < count; ++i){
+      if (MDNS.address(i) == target){
+        String name = MDNS.hostname(i);
+
+        if (name.length() > 0){
+          Serial.print(F("[MDNS] Found "));
+          Serial.print(target);
+          Serial.print(F(" -> "));
+          Serial.println(name);
+
+          return name;
+        }
+      }
+    }
+  }
+
+  return "UNKNOWN";
+}
+
+// For debugging prints the network information
+void printNetworkInformation(){
+  Serial.println();
+  Serial.println(F("Network information"));
+
+  Serial.print(F("IP address: "));
+  Serial.println(WiFi.localIP());
+
+  Serial.print(F("Gateway: "));
+  Serial.println(WiFi.gatewayIP());
+
+  Serial.print(F("Subnet mask: "));
+  Serial.println(WiFi.subnetMask());
+
+  Serial.print(F("DNS: "));
+  Serial.println(WiFi.dnsIP());
+
+  Serial.print(F("Network address: "));
+  Serial.println(calculateNetworkAddress());
+
+  if (subnetMask != IPAddress(255, 255, 255, 0)){
+    Serial.println(F("[WARN] This scanner is designed for /24 networks."));
+  }
+}
+
+// Scan control
+void runNetworkScan(){
+  if (WiFi.status() != WL_CONNECTED){
+    Serial.println(F("[WARN] Skipping scan: Wi-Fi disconnected."));
+    lastScanComplete = false;
+    return;
+  }
+
+  const unsigned long scanStartedAt = millis();
+
+  scanSequence++;
+  lastScanComplete = false;
+  lastScanTruncated = false;
+
+  Serial.println();
+  Serial.println(F("Starting network scan"));
+
+  clearCurrentScan();
+  discoverDevices();
+
+  Serial.println();
+  Serial.println(F("Collecting device information..."));
+
+  for (int i = 0; i < currentDeviceCount; i++){
+    if (WiFi.status() != WL_CONNECTED){
+      lastScanComplete = false;
+
+      Serial.println(F("[WARN] Wi-Fi dropped during inspection."));
+      break;
+    }
+
+    collectDeviceInfo(currentDevices[i]);
+  }
+
+  if (lastScanComplete) {
+    Serial.println();
+    Serial.println(F("Comparing against previous complete scan..."));
+
+    compareScans();
+  } else {
+    Serial.println(F("[WARN] Incomplete scan; comparison and baseline update skipped."));
+  }
+
+  lastScanDurationMs = millis() - scanStartedAt;
+
+  printDevices();
+  printEvents();
+  sendResultsToServer();
+
+  if (lastScanComplete){
+    saveCurrentAsPrevious();
+  }
+
+  Serial.print(F("Scan sequence: "));
+  Serial.println(scanSequence);
+
+  Serial.print(F("Scan complete: "));
+  Serial.println(lastScanComplete ? F("yes") : F("no"));
+
+  Serial.print(F("Scan truncated: "));
+  Serial.println(lastScanTruncated ? F("yes") : F("no"));
+
+  Serial.print(F("Scan duration ms: "));
+  Serial.println(lastScanDurationMs);
+}
+
+// Clear the current scan
+void clearCurrentScan(){
+  currentDeviceCount = 0;
+
+  for (int i = 0; i < MAX_DEVICES; i++){
+    currentDevices[i].online = false;
+    currentDevices[i].portCount = 0;
+    currentDevices[i].fingerprintScore = 0;
+  }
+}
+
+// Device Discovery
+void discoverDevices(){
+  lastScanComplete = false;
+  lastScanTruncated = false;
+
+  if (WiFi.status() != WL_CONNECTED || !arpReady){
+    Serial.println(F("[WARN] Discovery unavailable: Wi-Fi or ARP is not ready."));
+    return;
+  }
+
+  networkAddress = calculateNetworkAddress();
+  subnetMask = WiFi.subnetMask();
+
+  if (subnetMask != IPAddress(255, 255, 255, 0)){
+    Serial.println(F("[ERROR] Refusing to scan: subnet is not /24."));
+    return;
+  }
+
+  Serial.print(F("Scanning network: "));
+  Serial.println(networkAddress);
+
+  for (int host = 1; host <= 254; host++){
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println(F("[WARN] Wi-Fi dropped during discovery."));
+      return;
+    }
+
+    IPAddress target(networkAddress[0], networkAddress[1], networkAddress[2], host);
+
+    if (target == localIP){
+      continue;
+    }
+
+    Serial.print(F("[CHECK] "));
+    Serial.print(target);
+    Serial.print(F(" -> "));
+
+    String discoveredMac;
+
+    if (!checkHost(target, discoveredMac)){
+      Serial.println(F("No ARP response"));
+      delay(5);
+      continue;
+    }
+
+    Serial.print(F("ONLINE | MAC: "));
+    Serial.println(discoveredMac);
+
+    if (currentDeviceCount >= MAX_DEVICES){
+      lastScanTruncated = true;
+
+      Serial.println(F("[WARN] Device capacity reached; scan is truncated."));
 
       break;
     }
 
-    uint16_t port = COMMON_PORTS[i];
-    if(checkPort(device.ip,port)){
+    NetworkDevice& device = currentDevices[currentDeviceCount];
 
-      device.openPorts[device.portCount] = port;
-      device.portCount++;
-      Serial.print(port);
-    }
-    if(device.portCount == 0){
-      Serial.println("No common ports detected.");
+    device.ip = target;
+    device.online = true;
+    device.mac = discoveredMac;
+    device.hostname = "UNKNOWN";
+    device.vendor = "UNKNOWN";
+    device.deviceType = "Unknown";
+    device.portCount = 0;
+    device.fingerprintScore = 0;
+
+    bool existed = false;
+
+    for (int i = 0; i < previousDeviceCount; i++){
+      if ((previousDevices[i].mac.length() > 0 && previousDevices[i].mac != "UNKNOWN" && discoveredMac.length() > 0 && discoveredMac != "UNKNOWN" && previousDevices[i].mac.equalsIgnoreCase(discoveredMac)) || previousDevices[i].ip == target){
+
+        existed = true;
+        device.firstSeen = previousDevices[i].firstSeen;
+
+        if (previousDevices[i].hostname != "UNKNOWN"){
+          device.hostname = previousDevices[i].hostname;
+        }
+
+        if (previousDevices[i].vendor != "UNKNOWN"){
+          device.vendor = previousDevices[i].vendor;
+        }
+
+        break;
+      }
     }
 
+    if (!existed){
+      device.firstSeen = millis();
+    }
+
+    device.lastSeen = millis();
+    currentDeviceCount++;
+    Serial.print(F("Device added: "));
+    Serial.println(target);
+
+    delay(5);
+  }
+
+  Serial.print(F("Discovered devices: "));
+  Serial.println(currentDeviceCount);
+
+  lastScanComplete = (WiFi.status() == WL_CONNECTED) && !lastScanTruncated;
+
+  if (!lastScanComplete){
+    Serial.println(F("[WARN] Discovery did not complete successfully."));
   }
 }
-// Port Check
+
+// ARP / MAC Discovery
+bool checkHost(IPAddress ip, String& discoveredMac){
+  discoveredMac = "UNKNOWN";
+
+  if (!arpReady){
+    return false;
+  }
+
+  int requestResult = arp.sendRequest(ip.toString());
+
+  if (requestResult != ERR_OK){
+    return false;
+  }
+
+  delay(ARP_WAIT_MS);
+  mac_addr_t mac;
+  int result = arp.lookupEntry(ip.toString(), mac);
+
+  if (result != ERR_OK){
+    return false;
+  }
+
+  discoveredMac = macToString(mac);
+  return discoveredMac != "UNKNOWN";
+}
+
+// Converts a device's MAC address into a readable string
+String macToString(const mac_addr_t& mac){
+  char buffer[18];
+
+  snprintf(buffer, sizeof(buffer), "%02X:%02X:%02X:%02X:%02X:%02X", mac.addr[0], mac.addr[1], mac.addr[2], mac.addr[3], mac.addr[4], mac.addr[5]);
+
+  return String(buffer);
+}
+
+// Device Information
+void collectDeviceInfo(NetworkDevice& device){
+  Serial.println();
+  Serial.print(F("Inspecting "));
+  Serial.println(device.ip);
+
+  detectHostname(device);
+  identifyVendor(device);
+  detectService(device);
+  fingerprintDevice(device);
+}
+
+// Sends a NetBIOS Name Service (NBNS) query to a target IP address
+static String queryNetBIOSHostname(IPAddress target){
+  WiFiUDP udp;
+
+  const uint16_t localPort = 40137;
+  const uint16_t remotePort = 137;
+
+  uint8_t packet[50] = {0};
+
+  // NBNS transaction ID
+  packet[0] = 0x12;
+  packet[1] = 0x34;
+
+  // Standard query flags
+  packet[2] = 0x00;
+  packet[3] = 0x00;
+
+  // One question
+  packet[4] = 0x00;
+  packet[5] = 0x01;
+
+  // No answer, authority, or additional records
+  packet[6] = 0x00;
+  packet[7] = 0x00;
+  packet[8] = 0x00;
+  packet[9] = 0x00;
+  packet[10] = 0x00;
+  packet[11] = 0x00;
+
+  // Encoded NetBIOS wildcard name: *<00>
+  packet[12] = 0x20;
+
+  for (int i = 0; i < 16; i++){
+    uint8_t value = (i == 0) ? '*' : ' ';
+    packet[13 + i * 2] = 'A' + ((value >> 4) & 0x0F);
+    packet[14 + i * 2] = 'A' + (value & 0x0F);
+  }
+
+  packet[45] = 0x00;  // End of encoded name
+  packet[46] = 0x00;  // NB query type
+  packet[47] = 0x21;
+  packet[48] = 0x00;  // Internet class
+  packet[49] = 0x01;
+
+  if (!udp.begin(localPort)){
+    return "UNKNOWN";
+  }
+
+  if (!udp.beginPacket(target, remotePort)){
+    udp.stop();
+    return "UNKNOWN";
+  }
+
+  udp.write(packet, sizeof(packet));
+
+  if (!udp.endPacket()){
+    udp.stop();
+    return "UNKNOWN";
+  }
+
+  unsigned long started = millis();
+
+  while (millis() - started < 700){
+    int packetSize = udp.parsePacket();
+
+    if (packetSize >= 12){
+      uint8_t response[512];
+      int bytesRead = udp.read(response, min(packetSize, (int)sizeof(response)));
+
+      udp.stop();
+
+      if (bytesRead < 12){
+        return "UNKNOWN";
+      }
+
+      // Validate transaction ID and response flag
+      if (response[0] != 0x12 || response[1] != 0x34 || !(response[2] & 0x80)){
+        return "UNKNOWN";
+      }
+
+      // NBNS responses contain variable-length records.
+      // This minimal implementation doesn't parse those records.
+      // A complete parser is needed to extract a reliable name.
+      return "UNKNOWN";
+    }
+
+    delay(5);
+  }
+
+  udp.stop();
+  return "UNKNOWN";
+}
+
+// Detects the hostname 
+void detectHostname(NetworkDevice& device){
+  // Keep previously discovered hostnames.
+  if (device.hostname.length() > 0 && device.hostname != "UNKNOWN"){
+    return;
+  }
+
+  Serial.print(F("[HOSTNAME] Resolving "));
+  Serial.println(device.ip);
+
+  // First attempt: discover advertised mDNS services.
+  String resolved = queryMDNSHostname(device.ip);
+
+  // Second attempt: use the existing NetBIOS query.
+  if (resolved == "UNKNOWN"){
+    resolved = queryNetBIOSHostname(device.ip);
+  }
+
+  if (resolved.length() > 0 &&
+      resolved != "UNKNOWN") {
+    device.hostname = resolved;
+
+    Serial.print(F("[HOSTNAME] "));
+    Serial.print(device.ip);
+    Serial.print(F(" -> "));
+    Serial.println(device.hostname);
+  } else {
+    device.hostname = "UNKNOWN";
+
+    Serial.println(F("[HOSTNAME] No hostname response"));
+  }
+}
+
+// Identifies the vender of the device
+void identifyVendor(NetworkDevice& device){
+  if (device.mac.length() == 0 || device.mac == "UNKNOWN"){
+    device.vendor = "UNKNOWN";
+  } else {
+    device.vendor = lookupVendor(device.mac);
+  }
+
+  Serial.print(F("MAC: "));
+  Serial.println(device.mac);
+
+  Serial.print(F("Vendor: "));
+  Serial.println(device.vendor);
+}
+
+// Searches for the vendor 
+String lookupVendor(const String& mac){
+  String normalized;
+  normalized.reserve(12);
+
+  for (size_t i = 0; i < mac.length(); i++){
+    char c = mac[i];
+
+    if (c >= '0' && c <= '9'){
+      normalized += c;
+    } else if (c >= 'a' && c <= 'f'){
+      normalized += static_cast<char>(c - 'a' + 'A');
+    } else if (c >= 'A' && c <= 'F'){
+      normalized += c;
+    }
+  }
+
+  if (normalized.length() != 12){
+    return "Unknown vendor";
+  }
+
+  const char firstOctetText[] = {
+    normalized[0], normalized[1], '\0'
+  };
+
+  const uint8_t firstOctet = static_cast<uint8_t>(strtoul(firstOctetText, nullptr, 16));
+
+  if (firstOctet & 0x02){
+    return "Locally administered (vendor uncertain)";
+  }
+
+  const String prefix = normalized.substring(0, 6);
+
+  if (prefix == "246F28" || prefix == "7CDFA1"){
+    return "Espressif (known prefix)";
+  }
+
+  return "Unknown vendor";
+}
+
+// TCP Port Scan
+void detectService(NetworkDevice& device){
+  Serial.print(F("Open ports: "));
+
+  bool foundPort = false;
+
+  for (size_t i = 0; i < COMMON_PORT_COUNT; i++){
+    if (device.portCount >= MAX_PORTS){
+      break;
+    }
+
+    uint16_t port = COMMON_PORTS[i];
+
+    if (checkPort(device.ip, port)){
+      device.openPorts[device.portCount++] = port;
+
+      if (foundPort){
+        Serial.print(F(", "));
+      }
+
+      Serial.print(port);
+      foundPort = true;
+    }
+  }
+
+  if (!foundPort){
+    Serial.print(F("None detected"));
+  }
+
+  Serial.println();
+}
+
+// Checks whether a specified TCP port is reachable on a target IP address
 bool checkPort(IPAddress ip, uint16_t port){
   WiFiClient client;
-  client.setTimeout(250);
+  client.setTimeout(CONNECT_TIMEOUT_MS);
 
-  bool connected = client.connect(ip,port);
-
-  if(connected){
-
-    client.stop();
-    return true;
-  }
+  bool connected = client.connect(ip, port, CONNECT_TIMEOUT_MS);
 
   client.stop();
-  return false;
-}
-// Device Fingerprinting
-void fingerprintDevice(NetworkDevice &device){
 
-  int score = 0;
-  
+  return connected;
+}
+
+// Device Fingerprinting
+void fingerprintDevice(NetworkDevice& device){
   bool hasFTP = false;
   bool hasSSH = false;
   bool hasTelnet = false;
@@ -530,490 +856,555 @@ void fingerprintDevice(NetworkDevice &device){
   bool hasMQTT = false;
   bool hasHTTPAlt = false;
 
-  //Examine open ports
-  for(int i = 0; i < device.portCount; i++){
+  int score = 0;
+
+  for (int i = 0; i < device.portCount; i++){
     uint16_t port = device.openPorts[i];
 
-    if(port == 21){
+    if (port == 21){
       hasFTP = true;
-
       score += 10;
     }
 
-    if( port == 22){
+    if (port == 22){
       hasSSH = true;
-
       score += 15;
     }
 
-    if(port == 23){
+    if (port == 23){
       hasTelnet = true;
-
       score += 25;
     }
 
-    if(port == 53){
+    if (port == 53){
       hasDNS = true;
-
       score += 10;
     }
 
-    if(port == 80){
+    if (port == 80){
       hasHTTP = true;
-
       score += 20;
     }
 
-    if(port == 443){
+    if (port == 443){
       hasHTTPS = true;
-
       score += 20;
     }
 
-    if(port == 1883){
+    if (port == 1883){
       hasMQTT = true;
-
       score += 25;
     }
 
-    if(port == 8080){
+    if (port == 8080){
       hasHTTPAlt = true;
-
       score += 15;
     }
   }
 
-  if(hasMQTT && (hasHTTP || hasHTTPAlt)){
-    device.deviceType = "IoT Device";
-  } else if(hasTelnet){
+  if (hasMQTT && (hasHTTP || hasHTTPAlt)){
+    device.deviceType = "IoT / Network Service";
+  } else if (hasTelnet){
     device.deviceType = "Network Device";
-  }else if (hasSSH && (hasHTTP || hasHTTPS)){
+  } else if (hasSSH && (hasHTTP || hasHTTPS)){
     device.deviceType = "Computer / Server";
-  }else if(hasHTTP || hasHTTPS || hasHTTPAlt){
+  } else if (hasDNS && !hasHTTP && !hasHTTPS){
+    device.deviceType = "Possible DNS Server";
+  } else if (hasHTTP || hasHTTPS || hasHTTPAlt){
     device.deviceType = "Network Service";
-  }else if(hasDNS){
-    device.deviceType = "DNS Server";
-  }else{
-    device.deviceType = "UNKNOWN";
+  } else if (hasFTP || hasSSH){
+    device.deviceType = "Possible Server";
+  } else {
+    device.deviceType = "Unknown";
   }
 
   device.fingerprintScore = score;
-  Serial.print("Type: ");
+
+  Serial.print(F("Device type: "));
   Serial.println(device.deviceType);
 
-  Serial.print("Fingerprint Score: ");
+  Serial.print(F("Fingerprint score: "));
   Serial.println(device.fingerprintScore);
 }
-//Compare scans
-void compareScans(){
-  // First Scan
-  if(previousDeviceCount == 0){
-    Serial.println("No previous baseline.");
-    Serial.println("Current scan becomes baseline.");
 
+// Scan comparison
+// Looks at the device Mac address
+bool sameDevice(const NetworkDevice& a, const NetworkDevice& b){
+  const bool aHasMac = a.mac.length() > 0 && a.mac != "UNKNOWN";
+  const bool bHasMac = b.mac.length() > 0 && b.mac != "UNKNOWN";
+
+  if (aHasMac && bHasMac){
+    String aMac = a.mac;
+    String bMac = b.mac;
+    aMac.toUpperCase();
+    bMac.toUpperCase();
+    return aMac == bMac;
   }
-  //New Scan
-  for(int i = 0; i < currentDeviceCount; i++){
-    
+
+  return a.ip == b.ip;
+}
+
+void compareScans(){
+  if (!lastScanComplete){
+    Serial.println(F("[WARN] Skipping comparison: scan incomplete."));
+    return;
+  }
+
+  if (!baselineReady){
+    Serial.println(F("Initial complete scan: establishing baseline."));
+    return;
+  }
+
+  for (int i = 0; i < currentDeviceCount; i++){
+    NetworkDevice& current = currentDevices[i];
     bool foundBefore = false;
 
-    for(int j = 0; j < previousDeviceCount; j++){
-
-      if(currentDevices[i].ip == previousDevices[j].ip){
+    for (int j = 0; j < previousDeviceCount; j++){
+      if (sameDevice(current, previousDevices[j])){
         foundBefore = true;
-
-        break;
-      }
-    }
-    if(!foundBefore){
-      generateNewDeviceEvent(currentDevices[i]);
-
-    }
-  }
-  //Offline devices
-  for(int i = 0; i < previousDeviceCount; i++){
-
-    bool foundNow = false;
-
-    for(int j = 0; j < currentDeviceCount; j++){
-
-      if(previousDevices[i].ip == currentDevices[j].ip){
-
-        foundNow = true;
-
         break;
       }
     }
 
-    if(!foundNow){
-      generateOfflineDeviceEvent(previousDevices[i]);
+    if (!foundBefore && !isMissingDeviceTracked(current.ip)){
+      generateNewDeviceEvent(current);
     }
   }
 
-  // Port Change
-  for(int i = 0; i < currentDeviceCount; i++){
+  processMissingDeviceTracks();
 
-    for(int j = 0; j < previousDeviceCount; j++){
-      if(currentDevices[i].ip == previousDevices[j].ip){
+  for (int i = 0; i < currentDeviceCount; i++){
+    NetworkDevice& current = currentDevices[i];
 
-        // Newly open port
-        for(int p = 0; p < currentDevices[i].portCount; p++){
+    for (int j = 0; j < previousDeviceCount; j++){
+      NetworkDevice& previous = previousDevices[j];
 
-          uint16_t port = currentDevices[i].openPorts[p];
-          bool existed = false;
+      if (!sameDevice(current, previous)){
+        continue;
+      }
 
-          for(int old = 0; old < previousDevices[j].portCount; old++){
+      for (int p = 0; p < current.portCount; p++){
+        uint16_t port = current.openPorts[p];
+        bool existed = false;
 
-            if(previousDevices[j].openPorts[old] == port){
-
-              existed = true;
-              break;
-            }
-          }
-          if(!existed){
-            generatePortChangeEvent(currentDevices[i], port, true);
+        for (int old = 0; old < previous.portCount; old++){
+          if (previous.openPorts[old] == port){
+            existed = true;
+            break;
           }
         }
-        // Closed ports
-        for(int old = 0; old < previousDevices[j].portCount; old++){
-          uint16_t port = previousDevices[j].openPorts[old];
 
-          bool stillOpen = false;
+        if (!existed) {
+          generatePortChangeEvent(current, port, true);
+        }
+      }
 
-          for(int current = 0; current < currentDevices[i].portCount; current++){
-            if(currentDevices[i].openPorts[current] == port){
-              stillOpen = true;
+      for (int old = 0; old < previous.portCount; old++){
+        uint16_t port = previous.openPorts[old];
+        bool stillOpen = false;
 
+        for (int p = 0; p < current.portCount; p++){
+          if (current.openPorts[p] == port) {
+            stillOpen = true;
+            break;
+          }
+        }
+
+        if (!stillOpen){
+          generatePortChangeEvent(current, port, false);
+        }
+      }
+
+      break;
+    }
+  }
+}
+
+// Checks whether a device with the specified IP address already exist
+bool currentScanContains(IPAddress ip){
+  for (int i = 0; i < currentDeviceCount; i++){
+    if (currentDevices[i].ip == ip){
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Checks whether a device with the specified IP address is already recorded in the missing-device tracking list
+bool isMissingDeviceTracked(IPAddress ip){
+  for (int i = 0; i < missingTrackCount; i++){
+    if (missingTracks[i].ip == ip){
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Removes a device from the missing-device tracking list by index and shifts the remaining entries to maintain a continuous list
+void removeMissingTrack(int index){
+  if (index < 0 || index >= missingTrackCount){
+    return;
+  }
+
+  for (int i = index + 1; i < missingTrackCount; i++){
+    missingTracks[i - 1] = missingTracks[i];
+  }
+
+  missingTrackCount--;
+}
+
+// Tracks devices missing from completed scans, detects when they return
+void processMissingDeviceTracks(){
+  for (int i = 0; i < missingTrackCount;){
+    bool deviceReturned = currentScanContains(missingTracks[i].ip);
+
+    // Treat a device with the same MAC at a new DHCP address as returned.
+    if (!deviceReturned){
+      for (int p = 0; p < previousDeviceCount && !deviceReturned; p++){
+        if (previousDevices[p].ip == missingTracks[i].ip){
+          for (int c = 0; c < currentDeviceCount; c++){
+            if (sameDevice(previousDevices[p], currentDevices[c])) {
+              deviceReturned = true;
               break;
             }
-          }
-          if(!stillOpen){
-            generatePortChangeEvent(currentDevices[i],port,false);
           }
         }
       }
     }
+
+    if (deviceReturned){
+      if (missingTracks[i].offlineEventSent){
+        addEvent(
+          "DEVICE_RETURNED",
+          missingTracks[i].ip.toString(),
+          "Device returned after being absent from completed scans"
+        );
+      }
+
+      removeMissingTrack(i);
+      continue;
+    }
+
+    if (missingTracks[i].missedCompleteScans < OFFLINE_MISSED_SCANS){
+      missingTracks[i].missedCompleteScans++;
+    }
+
+    if (missingTracks[i].missedCompleteScans >= OFFLINE_MISSED_SCANS &&
+        !missingTracks[i].offlineEventSent){
+      addEvent(
+        "DEVICE_OFFLINE",
+        missingTracks[i].ip.toString(),
+        "Device absent from two consecutive complete scans"
+      );
+
+      missingTracks[i].offlineEventSent = true;
+    }
+
+    i++;
+  }
+
+  for (int p = 0; p < previousDeviceCount; p++){
+    const IPAddress missingIP = previousDevices[p].ip;
+
+    bool sameDeviceStillPresent = currentScanContains(missingIP);
+
+    for (int c = 0; c < currentDeviceCount && !sameDeviceStillPresent; c++){
+      if (sameDevice(previousDevices[p], currentDevices[c])){
+        sameDeviceStillPresent = true;
+      }
+    }
+
+    if (sameDeviceStillPresent || isMissingDeviceTracked(missingIP)){
+      continue;
+    }
+
+    if (missingTrackCount < MAX_DEVICES){
+      missingTracks[missingTrackCount].ip = missingIP;
+      missingTracks[missingTrackCount].missedCompleteScans = 1;
+      missingTracks[missingTrackCount].offlineEventSent = false;
+
+      missingTrackCount++;
+    } else {
+      Serial.println(F("[WARN] Missing-device tracking capacity reached."));
+    }
   }
 }
-// New Device Event
-void generateNewDeviceEvent(NetworkDevice &device){
-  addEvent("DEVICE_NEW",device.ip.toString(),"New device detected");
+
+// Records a new device when it is detected
+void generateNewDeviceEvent(NetworkDevice& device) {
+  addEvent("DEVICE_NEW", device.ip.toString(), "New device detected");
 }
 
-// Offline Device Event
-void generateOfflineDeviceEvent(NetworkDevice &device){
-  addEvent("DEVICE_OFFLINE",device.ip.toString(),"Previously seen device is offline");
+// Records when a device goes offline
+void generateOfflineDeviceEvent(NetworkDevice& device){
+  addEvent("DEVICE_OFFLINE", device.ip.toString(), "Previously seen device is offline");
 }
-//Port Change event
-void generatePortChangeEvent(NetworkDevice &device, uint16_t port, bool opened){
-  String description;
 
-
-  if (opened) {
-
-    description = "New service detected on port " + String(port);
-
-  }else {
-
-    description = "Previously open service closed on port " + String(port);
-  }
-
-  addEvent(
-    opened ? "PORT_OPENED" : "PORT_CLOSED",
-    device.ip.toString(),
-    description
-  );
+// Records when a devices port changes
+void generatePortChangeEvent(NetworkDevice& device, uint16_t port, bool opened){
+  String description = opened ? "New service detected on port " + String(port) : "Previously open service closed on port " + String(port);
+  addEvent(opened ? "PORT_OPENED" : "PORT_CLOSED", device.ip.toString(), description, port);
 }
-// Add Secuiryt Event
-void addEvent(String type, String ip, String description){
-  // Event Buffer full
-  if(eventCount >= MAX_EVENTS){
-    for(int i = 1; i < MAX_EVENTS; i++){
+
+// Event Queue
+void addEvent(const String& type, const String& ip, const String& description, int port){
+  if (eventCount >= MAX_EVENTS){
+    droppedEventCount++;
+
+    Serial.println(F("[WARN] Event queue full; oldest event dropped."));
+
+    for (int i = 1; i < MAX_EVENTS; i++){
       events[i - 1] = events[i];
     }
+
     eventCount = MAX_EVENTS - 1;
   }
 
-  events[eventCount].type = type;
+  SecurityEvent& event = events[eventCount++];
 
+  event.type = type;
+  event.ip = ip;
+  event.description = description;
+  event.port = port;
+  event.timestamp = millis();
 
-  events[eventCount].ip = ip;
-
-
-  events[eventCount].description = description;
-
-
-  events[eventCount].timestamp = millis();
-
-
-  eventCount++;
-
-  Serial.println("Security Event");
-
-  Serial.print( "Type: ");
-  Serial.println( type);
-
-  Serial.print("IP: ");
-
-  Serial.println(ip);
-
-
-  Serial.print("Description: ");
+  Serial.print(F("[EVENT] "));
+  Serial.print(type);
+  Serial.print(F(" | "));
+  Serial.print(ip);
+  Serial.print(F(" | "));
   Serial.println(description);
 }
-//Print Devices
-void printDevices(){
-  Serial.println("Network Devices");
-  if(currentDeviceCount == 0){
 
-    Serial.println("No devices found.");
+// Device Serial output
+void printDevices(){
+  Serial.println();
+  Serial.println(F("Device Inventory"));
+
+  if (currentDeviceCount == 0){
+    Serial.println(F("No devices discovered."));
     return;
   }
-  
-  for(int i = 0; i < currentDeviceCount; i++){
 
-    NetworkDevice &device = currentDevices[i];
-    Serial.print("Device #");
+  for (int i = 0; i < currentDeviceCount; i++){
+    NetworkDevice& device = currentDevices[i];
+
+    Serial.println();
+    Serial.print(F("Device #"));
     Serial.println(i + 1);
 
-    Serial.print("IP: ");
+    Serial.print(F("IP: "));
     Serial.println(device.ip);
 
-    Serial.print("Hostname: ");
+    Serial.print(F("Hostname: "));
     Serial.println(device.hostname);
 
-    Serial.print( "MAC: ");
+    Serial.print(F("MAC: "));
     Serial.println(device.mac);
 
-    Serial.print("Vendor: ");
+    Serial.print(F("Vendor: "));
     Serial.println(device.vendor);
 
-    Serial.print("Type: ");
+    Serial.print(F("Type: "));
     Serial.println(device.deviceType);
 
-    Serial.print("Ports: ");
+    Serial.print(F("Ports: "));
 
-    if(device.portCount == 0){
-      Serial.println("None");
-    }else{
-      for(int p = 0; p < device.portCount; p++){
-        Serial.print( device.openPorts[p]);
-
-        if(p < device.portCount - 1){
-          Serial.print(", ");
+    if (device.portCount == 0){
+      Serial.println(F("None detected"));
+    } else {
+      for (int p = 0; p < device.portCount; p++){
+        if (p > 0){
+          Serial.print(F(", "));
         }
+
+        Serial.print(device.openPorts[p]);
       }
+
+      Serial.println();
     }
-    Serial.print("Fingerprint: ");
+
+    Serial.print(F("Fingerprint: "));
     Serial.println(device.fingerprintScore);
 
-
-    Serial.print("First Seen: ");
+    Serial.print(F("First seen (uptime ms): "));
     Serial.println(device.firstSeen);
 
-
-    Serial.print("Last Seen: ");
+    Serial.print(F("Last seen (uptime ms): "));
     Serial.println(device.lastSeen);
   }
 }
-// Print Events
+
+// Prints Events 
 void printEvents(){
-
-  Serial.print("Security Events");
-  if(eventCount == 0){
-    Serial.println("No events.");
-
-    return;
-  }
-  for(int i = 0; i < eventCount; i++){
-    Serial.println();
-
-    Serial.print("[");
-    Serial.print(events[i].type);
-    Serial.println("]");
-
-
-    Serial.print("IP: ");
-    Serial.println(events[i].ip);
-
-    Serial.print("Event: ");
-    Serial.println(events[i].description);
-
-
-    Serial.print("Timestamp: ");
-    Serial.println(events[i].timestamp);
-  }
-}
-// Send results to esp #3 webserver
-void sendResultsToServer(){
-  // Check that the scanner is connected to Wi-Fi before sending data
-  if(WiFi.status() != WL_CONNECTED){
-    Serial.println("Cannot send Results");
-    return;
-  }
-  // Create an HTTP client to communicate with the web server
-  HTTPClient http;
-  // Set the destination URL for the scan results
-  http.begin(SERVER_URL);
-  // Specify that the request body contains JSON data
-  http.addHeader("Content-Type", "application/json");
-
-  //Build Json
-  String json ="{";
-
-  // Scanner
-  json += "\"scanner\":\"ESP32-01\",";
-
-  // Scanner IP
-  json += "\"scannerIP\":\"";
-  json += WiFi.localIP().toString();
-  json += "\",";
-
-  // Network
-  json += "\"network\":\"";
-  json += calculateNetworkAddress().toString();
-  json +=  "\",";
-
-  // Device Count
-  json += "\"deviceCount\":";
-  json += String(currentDeviceCount);
-  json += ",";
-
-  // Devices
-  json += "\"devices\":[";
-  // Specify that the request body contains JSON data
-  for(int i = 0; i < currentDeviceCount; i++){
-    NetworkDevice &device = currentDevices[i];
-
-    json += "{";
-
-    // IP
-    json += "\"ip\":\"";
-    json += device.ip.toString();
-    json += "\",";
-
-    //Hostname
-    json += "\"hostname\":\"";
-    json += device.hostname;
-    json += "\",";
-
-    // MAC
-    json += "\"mac\":\"";
-    json += device.mac;
-    json += "\",";
-
-    // Vendor
-    json += "\"vendor\":\"";
-    json += device.vendor;
-    json += "\",";
-
-    // Device Type
-    json += "\"type\":\"";
-    json += device.deviceType;
-    json += "\",";
-
-    // Fingerprint
-    json += "\"fingerprint\":";
-    json += String(device.fingerprintScore);
-    json += ",";
-
-    // First Seen 
-    json += "\"firstSeen\":";
-    json += String(device.firstSeen);
-    json += ",";
-
-    // Last Seen
-    json += "\"lastSeen\":";
-    json += String(device.lastSeen);
-    json += ",";
-
-    // Ports
-    json += "\"ports\":[";
-    // Add each detected open port to the JSON array
-    for(int p = 0;p < device.portCount;p++){
-      json += String(device.openPorts[p]);
-      // Add a comma between port entries, but not after the final entry
-      if(p < device.portCount - 1){
-        json += ",";
-      }
-    }
-    // Close the ports array and the current device object
-    json +=  "]";
-    json += "}";
-    // Separate device objects with commas when more devices remain
-    if(i < currentDeviceCount - 1){
-      json += ",";
-    }
-  }
-  // Close the devices array and add a comma before the next JSON field
-  json += "],";
-
-  //Security Events
-  json +=  "\"events\":[";
-  // Loop through each stored security event
-  for( int i = 0; i < eventCount; i++){
-    // Start a JSON object for the current event
-    json += "{";
-    // Add the event type, such as a newly discovered device
-    json += "\"type\":\"";
-    json += events[i].type;
-    json += "\",";
-    // Add the IP address associated with the event
-    json += "\"ip\":\"";
-    json += events[i].ip;
-    json += "\",";
-    // Include a description of what happened
-    json += "\"description\":\"";
-    json += events[i].description;
-    json += "\",";
-    // Add the timestamp associated with the event
-    json +=  "\"timestamp\":";
-    json += String(events[i].timestamp);
-    // Close the current event object
-    json += "}";
-    // Separate event objects with commas when more events remain
-    if( i < eventCount - 1){
-      json += ",";
-    }
-  }
-  // Close the events array and the complete JSON object
-  json += "]";
-  json += "}";
-
-  // Debug JSON
   Serial.println();
-  Serial.println("Sending JSON:");
-  Serial.println(json);
+  Serial.println(F("Security Events"));
 
-  // Send the JSON payload to the web server using an HTTP POST request
-  int responseCode = http.POST(json);
-  // Check whether the server returned a valid HTTP response code
-  if(responseCode > 0){
-    Serial.print("Server response: ");
-    Serial.println(responseCode);
-    // Retrieve the response body returned by the server
-    String response = http.getString();
-    
-    Serial.println("Server body:");
-    Serial.println(response);
-  }else{
-    Serial.print("HTTP error: ");
+  Serial.print(F("Queued events: "));
+  Serial.print(eventCount);
+  Serial.print(F(" | Dropped since boot: "));
+  Serial.println(droppedEventCount);
 
-    Serial.println(responseCode);
+  if (eventCount == 0){
+    Serial.println(F("No new events."));
+    return;
   }
-  // Release the HTTP client's resources after the request completes
-  http.end();
+
+  for (int i = 0; i < eventCount; i++){
+    Serial.print(F("["));
+    Serial.print(events[i].type);
+    Serial.print(F("] IP: "));
+    Serial.print(events[i].ip);
+    Serial.print(F(" | "));
+    Serial.println(events[i].description);
+  }
 }
-// Save the Current Scan
+
+// JSON Results sent to the Dashboard
+void sendResultsToServer(){
+  if (WiFi.status() != WL_CONNECTED){
+    lastUploadSucceeded = false;
+    lastUploadHttpCode = 0;
+
+    Serial.println(F("[ERROR] Cannot upload: Wi-Fi disconnected."));
+    return;
+  }
+
+  DynamicJsonDocument doc(12000);
+
+  doc["scanner"] = "ESP32-01";
+  doc["scannerIP"] = WiFi.localIP().toString();
+  doc["network"] = calculateNetworkAddress().toString();
+  doc["deviceCount"] = currentDeviceCount;
+
+  doc["scanComplete"] = lastScanComplete;
+  doc["scanTruncated"] = lastScanTruncated;
+  doc["scanSequence"] = scanSequence;
+  doc["scanDurationMs"] = lastScanDurationMs;
+  doc["scannerCapacity"] = MAX_DEVICES;
+
+  doc["eventCapacity"] = MAX_EVENTS;
+  doc["eventQueueCount"] = eventCount;
+  doc["droppedEventCount"] = droppedEventCount;
+
+  doc["previousUploadSucceeded"] = lastUploadSucceeded;
+  doc["previousUploadHttpCode"] = lastUploadHttpCode;
+
+  JsonArray deviceArray = doc.createNestedArray("devices");
+
+  for (int i = 0; i < currentDeviceCount; i++){
+    NetworkDevice& device = currentDevices[i];
+
+    JsonObject item = deviceArray.createNestedObject();
+
+    item["ip"] = device.ip.toString();
+    item["hostname"] = device.hostname;
+    item["mac"] = device.mac;
+    item["vendor"] = device.vendor;
+    item["type"] = device.deviceType;
+    item["fingerprint"] = device.fingerprintScore;
+    item["firstSeen"] = device.firstSeen;
+    item["lastSeen"] = device.lastSeen;
+    item["online"] = device.online;
+
+    item["portScanStatus"] = (device.portCount > 0) ? "open ports detected" : "no open ports detected; closed/filtered/inconclusive not distinguished";
+
+    JsonArray ports = item.createNestedArray("ports");
+
+    for (int p = 0; p < device.portCount; p++){
+      ports.add(device.openPorts[p]);
+    }
+  }
+
+  JsonArray eventArray = doc.createNestedArray("events");
+
+  for (int i = 0; i < eventCount; i++){
+    SecurityEvent& event = events[i];
+
+    JsonObject item = eventArray.createNestedObject();
+
+    item["type"] = event.type;
+    item["sourceIP"] = event.ip;
+    item["port"] = event.port;
+    item["service"] = "TCP";
+    item["details"] = event.description;
+    item["timestamp"] = event.timestamp;
+  }
+
+  String json;
+  serializeJson(doc, json);
+
+  Serial.println();
+  Serial.println(F("Upload"));
+
+  Serial.print(F("JSON bytes: "));
+  Serial.println(json.length());
+
+  if (doc.overflowed()){
+    lastUploadSucceeded = false;
+    lastUploadHttpCode = 0;
+
+    Serial.println(F("[ERROR] JSON document overflowed."));
+    return;
+  }
+
+  HTTPClient http;
+  http.setTimeout(5000);
+
+  if (!http.begin(SERVER_URL)){
+    lastUploadSucceeded = false;
+    lastUploadHttpCode = 0;
+
+    Serial.println(F("[ERROR] Could not initialize HTTP."));
+    return;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Connection", "close");
+
+  int responseCode = http.POST(json);
+  lastUploadHttpCode = responseCode;
+
+  Serial.print(F("HTTP response: "));
+  Serial.println(responseCode);
+
+  bool uploadSucceeded = false;
+
+  if (responseCode >= 200 && responseCode < 300){
+    Serial.print(F("Server reply: "));
+    Serial.println(http.getString());
+
+    uploadSucceeded = true;
+  } else {
+    Serial.print(F("Upload failed: "));
+    Serial.println(http.errorToString(responseCode));
+  }
+
+  http.end();
+
+  lastUploadSucceeded = uploadSucceeded;
+
+  if (uploadSucceeded && lastScanComplete){
+    eventCount = 0;
+
+    Serial.println(F("[OK] Complete scan accepted; uploaded events cleared."));
+  } else if (uploadSucceeded){
+    Serial.println(F("[WARN] Partial scan accepted; event queue retained."));
+  }
+}
+
+// Saves the current scan as the next baseline
 void saveCurrentAsPrevious(){
-  // Store the number of devices detected in the current scan
   previousDeviceCount = currentDeviceCount;
-  // Copy each detected device into the previous scan list
-  for(int i = 0; i < currentDeviceCount; i++){
-    // Save the current device information for future comparisons
+
+  for (int i = 0; i < currentDeviceCount; i++){
     previousDevices[i] = currentDevices[i];
   }
 
-  Serial.print("Baseline updated. Devices: ");
+  baselineReady = true;
+
+  Serial.print(F("Baseline updated. Devices: "));
   Serial.println(previousDeviceCount);
 }
